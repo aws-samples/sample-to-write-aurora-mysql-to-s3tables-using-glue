@@ -1,0 +1,1344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Aurora MySQL Serverless v2 with Glue Job for S3 Tables Migration'
+
+Parameters:
+  DatabaseName:
+    Type: String
+    Default: tickit
+    Description: Name of the initial database
+
+  MasterUsername:
+    Type: String
+    Default: admin
+    Description: Master username for Aurora MySQL
+
+  VpcCidr:
+    Type: String
+    Default: 10.1.0.0/16
+    Description: CIDR block for VPC
+
+  S3TableBucketName:
+    Type: String
+    Description: Name of the S3 Tables bucket to create (or use existing)
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must be a valid S3 Tables bucket name (lowercase, numbers, hyphens)
+
+  S3TableNamespace:
+    Type: String
+    Default: tickit
+    Description: Namespace for S3 Tables
+
+Resources:
+  # VPC and Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-2'
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.3.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-3'
+
+  # Route Table for Private Subnets
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet3
+      RouteTableId: !Ref PrivateRouteTable
+
+  # VPC Endpoints for private subnet access
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  CloudFormationVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cloudformation'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  SecretsManagerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  GlueVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.glue'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  STSVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  LogsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  S3TablesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3tables'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS access from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc-endpoint-sg'
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${AWS::StackName}-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for Aurora MySQL
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+
+  # Security Groups
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora MySQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref VpcCidr
+          Description: MySQL access from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-sg'
+
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Glue connections
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-glue-sg'
+
+  GlueSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GlueSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref GlueSecurityGroup
+      Description: Allow Glue components to communicate
+
+  # S3 Bucket for Glue assets (scripts, jars, etc.)
+  GlueAssetsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub 'glue-assets-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-glue-assets'
+
+  # S3 Bucket for staging TICKIT sample data
+  # Data is downloaded from public AWS bucket, then Lambda loads it into Aurora
+  TickitDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub 'tickit-data-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tickit-data'
+
+  # IAM Role for Lambda to download TICKIT data from public S3
+  TickitDataLoaderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-TickitDataLoaderRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read access to public Redshift downloads bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::redshift-downloads
+                  - arn:aws:s3:::redshift-downloads/*
+              # Write access to TICKIT staging bucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub '${TickitDataBucket.Arn}/*'
+
+  # Lambda Function to automatically download TICKIT sample data files
+  # This runs during stack creation and copies files from AWS public bucket
+  TickitDataLoaderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-tickit-data-loader'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt TickitDataLoaderLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3_client = boto3.client('s3')
+
+          # Source: AWS public sample data bucket
+          SOURCE_BUCKET = 'redshift-downloads'
+          SOURCE_PREFIX = 'tickit/'
+          FILES = [
+              'allevents_pipe.txt',
+              'allusers_pipe.txt',
+              'category_pipe.txt',
+              'date2008_pipe.txt',
+              'listings_pipe.txt',
+              'sales_tab.txt',
+              'venue_pipe.txt'
+          ]
+
+          def lambda_handler(event, context):
+              logger.info(f"Event: {event}")
+
+              request_type = event.get('RequestType')
+              if request_type == 'Delete':
+                  logger.info("Delete request - no action needed")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              if request_type not in ['Create', 'Update']:
+                  logger.info(f"Unknown request type: {request_type}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  dest_bucket = event['ResourceProperties']['DestinationBucket']
+                  logger.info(f"Downloading TICKIT files to {dest_bucket}")
+
+                  downloaded_files = []
+                  for file_name in FILES:
+                      source_key = f"{SOURCE_PREFIX}{file_name}"
+                      dest_key = file_name
+
+                      logger.info(f"Copying {source_key} from {SOURCE_BUCKET} to {dest_bucket}/{dest_key}")
+
+                      # Copy file from public bucket to staging bucket
+                      copy_source = {'Bucket': SOURCE_BUCKET, 'Key': source_key}
+                      s3_client.copy_object(
+                          CopySource=copy_source,
+                          Bucket=dest_bucket,
+                          Key=dest_key
+                      )
+
+                      downloaded_files.append(file_name)
+                      logger.info(f"Successfully copied {file_name}")
+
+                  response_data = {
+                      'FilesDownloaded': len(downloaded_files),
+                      'Files': ','.join(downloaded_files)
+                  }
+
+                  logger.info(f"All files downloaded successfully: {downloaded_files}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  logger.error(f"Error downloading files: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Custom Resource to trigger Lambda during stack creation
+  TickitDataDownload:
+    Type: Custom::TickitDataDownload
+    Properties:
+      ServiceToken: !GetAtt TickitDataLoaderLambda.Arn
+      DestinationBucket: !Ref TickitDataBucket
+
+  # IAM Role for Glue Script Uploader Lambda
+  GlueScriptUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-GlueScriptUploaderRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3GlueAssetsBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub 'arn:aws:s3:::${GlueAssetsBucket}/scripts/*'
+
+  # Lambda Function to upload Glue script to S3
+  # This eliminates the need to manually upload the script via deploy.sh
+  GlueScriptUploaderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-glue-script-uploader'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt GlueScriptUploaderRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3_client = boto3.client('s3')
+
+          # Embedded Glue script content for MySQL to Iceberg migration
+          MYSQL_TO_ICEBERG_SCRIPT = '''import sys
+          from awsglue.transforms import *
+          from awsglue.utils import getResolvedOptions
+          from pyspark.context import SparkContext
+          from awsglue.context import GlueContext
+          from awsglue.job import Job
+          from pyspark.sql import SparkSession
+          import logging
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Get job parameters
+          args = getResolvedOptions(sys.argv, ['JOB_NAME', 'CONNECTION_NAME', 'DATABASE_NAME', 'S3_TABLE_NAMESPACE'])
+
+          # Initialize Spark context
+          sc = SparkContext()
+
+          # Configure Spark session for S3 Tables REST endpoint
+          spark = SparkSession.builder.appName("MySQLToS3TablesREST") \\
+              .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \\
+              .config("spark.sql.defaultCatalog", "s3_rest_catalog") \\
+              .config("spark.sql.catalog.s3_rest_catalog", "org.apache.iceberg.spark.SparkCatalog") \\
+              .config("spark.sql.catalog.s3_rest_catalog.type", "rest") \\
+              .config("spark.sql.catalog.s3_rest_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \\
+              .config("spark.sql.catalog.s3_rest_catalog.rest-metrics-reporting-enabled", "false") \\
+              .config('spark.sql.parquet.enableVectorizedReader', 'false') \\
+              .getOrCreate()
+
+          # Initialize Glue context and job
+          glueContext = GlueContext(spark.sparkContext)
+          job = Job(glueContext)
+          job.init(args['JOB_NAME'], args)
+
+          logger.info("Spark session initialized for S3 Tables migration with REST endpoint")
+
+          # Configuration - read from job parameters (set by CloudFormation)
+          mysql_connection = args['CONNECTION_NAME']
+          database = args['DATABASE_NAME']
+          s3_table_namespace = args['S3_TABLE_NAMESPACE']
+
+          # Define TICKIT tables to migrate from MySQL
+          tables_config = {
+              "users": {
+                  "primary_key": "userid",
+                  "description": "User information"
+              },
+              "venue": {
+                  "primary_key": "venueid",
+                  "description": "Venue details"
+              },
+              "category": {
+                  "primary_key": "catid",
+                  "description": "Event categories"
+              },
+              "date": {
+                  "primary_key": "dateid",
+                  "description": "Date dimension"
+              },
+              "event": {
+                  "primary_key": "eventid",
+                  "description": "Event information"
+              },
+              "listing": {
+                  "primary_key": "listid",
+                  "description": "Ticket listings"
+              },
+              "sales": {
+                  "primary_key": "salesid",
+                  "description": "Sales transactions"
+              }
+          }
+
+          def read_mysql_table(table_name):
+              """Read table from Aurora MySQL using JDBC connection"""
+              try:
+                  logger.info(f"Reading table: {table_name} from Aurora MySQL")
+
+                  # Create dynamic frame from MySQL using the Glue connection
+                  dynamic_frame = glueContext.create_dynamic_frame.from_options(
+                      connection_type="mysql",
+                      connection_options={
+                          "useConnectionProperties": "true",
+                          "dbtable": table_name,
+                          "connectionName": mysql_connection,
+                      },
+                      transformation_ctx=f"read_mysql_{table_name}"
+                  )
+
+                  record_count = dynamic_frame.count()
+                  logger.info(f"Successfully read {record_count} records from {table_name}")
+
+                  if record_count == 0:
+                      logger.warning(f"Table {table_name} is empty")
+
+                  return dynamic_frame
+
+              except Exception as e:
+                  logger.error(f"Error reading table {table_name} from MySQL: {str(e)}")
+                  return None
+
+          def write_to_s3_tables_iceberg(dynamic_frame, table_name):
+              """Write data to S3 Tables using Iceberg format via REST endpoint"""
+              try:
+                  if dynamic_frame is None:
+                      logger.warning(f"No data frame provided for table {table_name}")
+                      return False
+
+                  record_count = dynamic_frame.count()
+                  if record_count == 0:
+                      logger.warning(f"No data to write for table {table_name}")
+                      return True
+
+                  # Convert to Spark DataFrame for Iceberg operations
+                  df = dynamic_frame.toDF()
+
+                  # Log schema information
+                  logger.info(f"Schema for {table_name}:")
+                  df.printSchema()
+
+                  # Create namespace if it doesn't exist
+                  try:
+                      spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {s3_table_namespace}")
+                      logger.info(f"Namespace {s3_table_namespace} ready")
+                  except Exception as e:
+                      logger.warning(f"Namespace creation warning (may already exist): {str(e)}")
+
+                  # Full table name in S3 Tables
+                  full_table_name = f"{s3_table_namespace}.{table_name}"
+
+                  logger.info(f"Writing {record_count} records to S3 Tables: {full_table_name}")
+
+                  # Register DataFrame as temporary view
+                  df.createOrReplaceTempView(f"temp_{table_name}")
+
+                  # Check if table exists
+                  table_exists = False
+                  try:
+                      spark.sql(f"DESCRIBE TABLE {full_table_name}")
+                      table_exists = True
+                      logger.info(f"Table {full_table_name} already exists")
+                  except Exception as e:
+                      logger.info(f"Table {full_table_name} does not exist, will create it")
+
+                  if table_exists:
+                      # Use INSERT OVERWRITE to replace all data (Iceberg supported)
+                      logger.info(f"Using INSERT OVERWRITE to replace data in {full_table_name}")
+                      insert_sql = f"INSERT OVERWRITE {full_table_name} SELECT * FROM temp_{table_name}"
+                      spark.sql(insert_sql)
+                  else:
+                      # Create table with schema and insert data
+                      columns_ddl = ", ".join([f"`{field.name}` {field.dataType.simpleString()}" for field in df.schema.fields])
+                      create_table_sql = f"""
+                      CREATE TABLE IF NOT EXISTS {full_table_name} (
+                          {columns_ddl}
+                      ) USING ICEBERG
+                      """
+                      spark.sql(create_table_sql)
+                      logger.info(f"Created table {full_table_name}")
+
+                      # Insert data
+                      insert_sql = f"INSERT INTO {full_table_name} SELECT * FROM temp_{table_name}"
+                      spark.sql(insert_sql)
+
+                  logger.info(f"Successfully created S3 Table: {full_table_name}")
+
+                  # Verify the write
+                  verification_count = spark.sql(f"SELECT COUNT(*) as count FROM {full_table_name}").collect()[0]['count']
+                  logger.info(f"Verification: {verification_count} records in {full_table_name}")
+
+                  # Show sample data
+                  logger.info(f"Sample data from {full_table_name}:")
+                  spark.sql(f"SELECT * FROM {full_table_name} LIMIT 5").show()
+
+                  return True
+
+              except Exception as e:
+                  logger.error(f"Error writing table {table_name} to S3 Tables: {str(e)}")
+                  return False
+
+          def verify_s3_tables_connection():
+              """Verify S3 Tables REST endpoint connection"""
+              try:
+                  logger.info("Verifying S3 Tables REST endpoint connection...")
+
+                  # Show catalogs
+                  logger.info("Available catalogs:")
+                  spark.sql("SHOW CATALOGS").show()
+
+                  # Show namespaces
+                  logger.info("Available namespaces in s3_rest_catalog:")
+                  spark.sql("SHOW NAMESPACES IN s3_rest_catalog").show()
+
+                  return True
+              except Exception as e:
+                  logger.error(f"S3 Tables REST endpoint connection verification failed: {str(e)}")
+                  return False
+
+          # Main ETL process
+          def main():
+              """Main ETL process to migrate tables from Aurora MySQL to S3 Tables"""
+              logger.info("Starting Aurora MySQL to S3 Tables migration using REST endpoint")
+              logger.info(f"Source: Aurora MySQL database '{database}'")
+              logger.info(f"Target: S3 Tables namespace '{s3_table_namespace}'")
+
+              # Verify S3 Tables connection
+              if not verify_s3_tables_connection():
+                  logger.error("Failed to verify S3 Tables REST endpoint connection. Exiting.")
+                  return
+
+              successful_migrations = 0
+              failed_migrations = 0
+              migration_summary = []
+
+              for table_name, config in tables_config.items():
+                  try:
+                      logger.info(f"Processing table: {table_name} - {config['description']}")
+
+                      # Read from Aurora MySQL
+                      mysql_data = read_mysql_table(table_name)
+
+                      if mysql_data is not None:
+                          # Write to S3 Tables in Iceberg format
+                          success = write_to_s3_tables_iceberg(mysql_data, table_name)
+
+                          if success:
+                              successful_migrations += 1
+                              status = "SUCCESS"
+                              logger.info(f"✓ Successfully migrated {table_name}")
+                          else:
+                              failed_migrations += 1
+                              status = "FAILED"
+                              logger.error(f"✗ Failed to migrate {table_name}")
+                      else:
+                          failed_migrations += 1
+                          status = "FAILED - READ ERROR"
+                          logger.error(f"✗ Failed to read {table_name} from MySQL")
+
+                      migration_summary.append({
+                          "table": table_name,
+                          "status": status,
+                          "primary_key": config["primary_key"]
+                      })
+
+                  except Exception as e:
+                      failed_migrations += 1
+                      logger.error(f"✗ Unexpected error processing {table_name}: {str(e)}")
+                      migration_summary.append({
+                          "table": table_name,
+                          "status": f"ERROR: {str(e)}",
+                          "primary_key": config.get("primary_key", "unknown")
+                      })
+
+              # Print migration summary
+              logger.info("=" * 60)
+              logger.info("MIGRATION SUMMARY")
+              logger.info("=" * 60)
+              for summary in migration_summary:
+                  logger.info(f"Table: {summary['table']:<15} | Status: {summary['status']:<20} | PK: {summary['primary_key']}")
+
+              logger.info("=" * 60)
+              logger.info(f"Migration completed: {successful_migrations} successful, {failed_migrations} failed")
+
+              if failed_migrations > 0:
+                  logger.warning(f"Migration completed with {failed_migrations} failures")
+              else:
+                  logger.info("All tables migrated successfully to S3 Tables!")
+
+          # Execute main process
+          if __name__ == "__main__":
+              main()
+              job.commit()
+          '''
+
+          def lambda_handler(event, context):
+              logger.info(f"Event: {event}")
+
+              request_type = event.get('RequestType')
+              if request_type == 'Delete':
+                  logger.info("Delete request - no action needed")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              if request_type not in ['Create', 'Update']:
+                  logger.info(f"Unknown request type: {request_type}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  bucket_name = event['ResourceProperties']['BucketName']
+
+                  # Upload MySQL to Iceberg ETL script
+                  script_key = 'scripts/mysql-to-iceberg.py'
+                  logger.info(f"Uploading Glue script to s3://{bucket_name}/{script_key}")
+
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=script_key,
+                      Body=MYSQL_TO_ICEBERG_SCRIPT.encode('utf-8'),
+                      ContentType='text/x-python'
+                  )
+
+                  logger.info(f"Successfully uploaded {script_key}")
+
+                  response_data = {
+                      'UploadedScripts': script_key,
+                      'ScriptCount': 1
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  logger.error(f"Error uploading Glue scripts: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Custom Resource to trigger Glue script upload
+  GlueScriptUpload:
+    Type: Custom::GlueScriptUpload
+    Properties:
+      ServiceToken: !GetAtt GlueScriptUploaderLambda.Arn
+      BucketName: !Ref GlueAssetsBucket
+      Version: '3.0'  # Incremented for glueetl job type change
+
+  # Secrets Manager for Aurora credentials
+  AuroraAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-aurora-admin'
+      Description: Aurora MySQL admin credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+
+  # Aurora MySQL Serverless v2 Cluster
+  AuroraDBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: '8.0.mysql_aurora.3.11.1'
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: !Sub '{{resolve:secretsmanager:${AuroraAdminSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${AuroraAdminSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      EnableHttpEndpoint: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 1
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cluster'
+
+  AuroraDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-mysql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref AuroraDBCluster
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-instance'
+
+  # IAM Role for S3 Tables Bucket Creator Lambda
+  S3TableBucketCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-S3TableBucketCreatorRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3TablesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3tables:CreateTableBucket
+                  - s3tables:GetTableBucket
+                  - s3tables:ListTableBuckets
+                Resource: '*'
+
+  # Lambda Function to create S3 Tables bucket during stack deployment
+  S3TableBucketCreatorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-s3table-bucket-creator'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt S3TableBucketCreatorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3tables = boto3.client('s3tables')
+
+          def lambda_handler(event, context):
+              logger.info(f"Event: {event}")
+
+              request_type = event.get('RequestType')
+              if request_type == 'Delete':
+                  logger.info("Delete request - S3 Tables bucket retained (not deleted)")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              if request_type not in ['Create', 'Update']:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              bucket_name = event['ResourceProperties']['S3TableBucketName']
+
+              try:
+                  if request_type == 'Create':
+                      logger.info(f"Creating S3 Tables bucket: {bucket_name}")
+                      response = s3tables.create_table_bucket(name=bucket_name)
+                      bucket_arn = response['arn']
+                      logger.info(f"Created S3 Tables bucket: {bucket_arn}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'BucketArn': bucket_arn,
+                          'BucketName': bucket_name
+                      })
+                  else:
+                      logger.info("Update request - no action needed for S3 Tables bucket")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+              except Exception as e:
+                  error_msg = str(e)
+                  if 'BucketAlreadyExists' in error_msg or 'already exists' in error_msg.lower():
+                      logger.info(f"S3 Tables bucket '{bucket_name}' already exists - treating as success")
+                      try:
+                          buckets = s3tables.list_table_buckets().get('tableBuckets', [])
+                          bucket_arn = next(
+                              (b['arn'] for b in buckets if b['name'] == bucket_name), None
+                          )
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                              'BucketArn': bucket_arn or '',
+                              'BucketName': bucket_name
+                          })
+                      except Exception as inner_e:
+                          logger.warning(f"Could not retrieve bucket ARN: {str(inner_e)}")
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                              'BucketName': bucket_name
+                          })
+                  else:
+                      logger.error(f"Error creating S3 Tables bucket: {error_msg}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': error_msg})
+
+  # Custom Resource to create S3 Tables bucket during stack creation
+  S3TableBucketCreation:
+    Type: Custom::S3TableBucketCreation
+    Properties:
+      ServiceToken: !GetAtt S3TableBucketCreatorLambda.Arn
+      S3TableBucketName: !Ref S3TableBucketName
+
+  # IAM Role for Glue Job
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-GlueJobRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonS3TablesFullAccess
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+      Policies:
+        - PolicyName: DirectS3TablesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 's3tables:*'
+                Resource:
+                  - !Sub 'arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${S3TableBucketName}'
+                  - !Sub 'arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${S3TableBucketName}/*'
+        - PolicyName: LakeFormationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lakeformation:GetDataAccess'
+                Resource: '*'
+        - PolicyName: VPCNetworkAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+
+  # Glue Connection to Aurora MySQL (MYSQL type with schema v2 for Glue 5.0)
+  GlueAuroraConnection:
+    Type: AWS::Glue::Connection
+    DependsOn: GlueJobRole
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub '${AWS::StackName}-aurora-mysql-connection'
+        ConnectionType: MYSQL
+        ConnectionProperties:
+          HOST: !GetAtt AuroraDBCluster.Endpoint.Address
+          PORT: !GetAtt AuroraDBCluster.Endpoint.Port
+          DATABASE: !Ref DatabaseName
+          ROLE_ARN: !GetAtt GlueJobRole.Arn
+          JDBC_ENFORCE_SSL: 'false'
+        AuthenticationConfiguration:
+          AuthenticationType: BASIC
+          SecretArn: !Ref AuroraAdminSecret
+        ValidateForComputeEnvironments:
+          - SPARK
+        PhysicalConnectionRequirements:
+          SubnetId: !Ref PrivateSubnet1
+          SecurityGroupIdList:
+            - !Ref GlueSecurityGroup
+            - !Ref AuroraSecurityGroup
+          AvailabilityZone: !Select [0, !GetAZs '']
+
+  # Glue Job
+  MySQLToIcebergGlueJob:
+    Type: AWS::Glue::Job
+    DependsOn: S3TableBucketCreation
+    Properties:
+      Name: mysql-tickit-to-iceberg-job
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${GlueAssetsBucket}/scripts/mysql-to-iceberg.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--enable-spark-ui': 'true'
+        '--datalake-formats': 'iceberg'
+        '--enable-job-insights': 'true'
+        '--job-language': 'python'
+        '--enable-auto-scaling': 'true'
+        '--CONNECTION_NAME': !Sub '${AWS::StackName}-aurora-mysql-connection'
+        '--DATABASE_NAME': !Ref DatabaseName
+        '--S3_TABLE_NAMESPACE': !Ref S3TableNamespace
+        '--conf': !Sub >-
+          spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+          --conf spark.sql.defaultCatalog=s3_rest_catalog
+          --conf spark.sql.catalog.s3_rest_catalog=org.apache.iceberg.spark.SparkCatalog
+          --conf spark.sql.catalog.s3_rest_catalog.type=rest
+          --conf spark.sql.catalog.s3_rest_catalog.uri=https://s3tables.${AWS::Region}.amazonaws.com/iceberg
+          --conf spark.sql.catalog.s3_rest_catalog.warehouse=arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${S3TableBucketName}
+          --conf spark.sql.catalog.s3_rest_catalog.rest.sigv4-enabled=true
+          --conf spark.sql.catalog.s3_rest_catalog.rest.signing-name=s3tables
+          --conf spark.sql.catalog.s3_rest_catalog.rest.signing-region=${AWS::Region}
+      Connections:
+        Connections:
+          - !Ref GlueAuroraConnection
+      GlueVersion: '5.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 8
+      Timeout: 2880
+      MaxRetries: 0
+
+  # Security Group for Aurora Data Loader Lambda
+  AuroraDataLoaderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora data loader Lambda function
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-loader-lambda-sg'
+
+  # IAM Role for PyMySQL Lambda Layer Builder
+  PyMySQLLayerBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-PyMySQLLayerBuilderRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3LayerUpload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${GlueAssetsBucket}/layers/*'
+
+  # Lambda to build PyMySQL layer (runs outside VPC with internet access)
+  PyMySQLLayerBuilderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-pymysql-layer-builder'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt PyMySQLLayerBuilderRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import subprocess, sys, zipfile, os, shutil, boto3, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+              logger.info(f"Event: {event}")
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              if event['RequestType'] not in ['Create', 'Update']:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  s3_key = 'layers/pymysql-layer.zip'
+                  install_path = '/tmp/python'
+                  if os.path.exists(install_path):
+                      shutil.rmtree(install_path)
+                  logger.info("Installing PyMySQL...")
+                  subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pymysql', '-t', install_path, '--no-cache-dir'])
+                  zip_path = '/tmp/pymysql-layer.zip'
+                  with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                      for root, dirs, files in os.walk(install_path):
+                          for f in files:
+                              fp = os.path.join(root, f)
+                              zf.write(fp, os.path.relpath(fp, '/tmp'))
+                  logger.info(f"Layer zip size: {os.path.getsize(zip_path)} bytes")
+                  boto3.client('s3').upload_file(zip_path, bucket, s3_key)
+                  logger.info(f"Uploaded layer to s3://{bucket}/{s3_key}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'S3Bucket': bucket, 'S3Key': s3_key})
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Custom Resource to trigger PyMySQL layer build
+  PyMySQLLayerBuild:
+    Type: Custom::PyMySQLLayerBuild
+    Properties:
+      ServiceToken: !GetAtt PyMySQLLayerBuilderLambda.Arn
+      BucketName: !Ref GlueAssetsBucket
+      Version: '1.0'
+
+  # PyMySQL Lambda Layer
+  PyMySQLLayer:
+    Type: AWS::Lambda::LayerVersion
+    DependsOn: PyMySQLLayerBuild
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-pymysql'
+      Description: PyMySQL library for Aurora MySQL access
+      Content:
+        S3Bucket: !Ref GlueAssetsBucket
+        S3Key: layers/pymysql-layer.zip
+      CompatibleRuntimes:
+        - python3.12
+        - python3.11
+
+  # IAM Role for Aurora Data Loader Lambda
+  AuroraDataLoaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-AuroraDataLoaderRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${TickitDataBucket.Arn}'
+                  - !Sub '${TickitDataBucket.Arn}/*'
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AuroraAdminSecret
+
+  # Lambda Function to load TICKIT data into Aurora MySQL using PyMySQL
+  AuroraDataLoaderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-aurora-data-loader'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AuroraDataLoaderRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Layers:
+        - !Ref PyMySQLLayer
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+        SecurityGroupIds:
+          - !Ref AuroraDataLoaderSecurityGroup
+      Code:
+        ZipFile: |
+          import json, os, boto3, pymysql, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          # Table definitions: (name, file, delimiter, DDL columns, LOAD columns)
+          TABLES = [
+              ('users', 'allusers_pipe.txt', '|',
+               'userid INTEGER NOT NULL PRIMARY KEY, username CHAR(8), firstname VARCHAR(30), lastname VARCHAR(30), city VARCHAR(30), state CHAR(2), email VARCHAR(100), phone CHAR(14), likesports BOOLEAN, liketheatre BOOLEAN, likeconcerts BOOLEAN, likejazz BOOLEAN, likeclassical BOOLEAN, likeopera BOOLEAN, likerock BOOLEAN, likevegas BOOLEAN, likebroadway BOOLEAN, likemusicals BOOLEAN',
+               '(userid, username, firstname, lastname, city, state, email, phone, likesports, liketheatre, likeconcerts, likejazz, likeclassical, likeopera, likerock, likevegas, likebroadway, likemusicals)'),
+              ('venue', 'venue_pipe.txt', '|',
+               'venueid SMALLINT NOT NULL PRIMARY KEY, venuename VARCHAR(100), venuecity VARCHAR(30), venuestate CHAR(2), venueseats INTEGER',
+               '(venueid, venuename, venuecity, venuestate, venueseats)'),
+              ('category', 'category_pipe.txt', '|',
+               'catid SMALLINT NOT NULL PRIMARY KEY, catgroup VARCHAR(10), catname VARCHAR(10), catdesc VARCHAR(50)',
+               '(catid, catgroup, catname, catdesc)'),
+              ('date', 'date2008_pipe.txt', '|',
+               'dateid SMALLINT NOT NULL PRIMARY KEY, caldate DATE NOT NULL, day CHAR(3) NOT NULL, week SMALLINT NOT NULL, month CHAR(5) NOT NULL, qtr CHAR(5) NOT NULL, year SMALLINT NOT NULL, holiday BOOLEAN DEFAULT FALSE',
+               '(dateid, caldate, day, week, month, qtr, year, holiday)'),
+              ('event', 'allevents_pipe.txt', '|',
+               'eventid INTEGER NOT NULL PRIMARY KEY, venueid SMALLINT NOT NULL, catid SMALLINT NOT NULL, dateid SMALLINT NOT NULL, eventname VARCHAR(200), starttime TIMESTAMP',
+               '(eventid, venueid, catid, dateid, eventname, starttime)'),
+              ('listing', 'listings_pipe.txt', '|',
+               'listid INTEGER NOT NULL PRIMARY KEY, sellerid INTEGER NOT NULL, eventid INTEGER NOT NULL, dateid SMALLINT NOT NULL, numtickets SMALLINT NOT NULL, priceperticket DECIMAL(8,2), totalprice DECIMAL(8,2), listtime TIMESTAMP',
+               '(listid, sellerid, eventid, dateid, numtickets, priceperticket, totalprice, listtime)'),
+              ('sales', 'sales_tab.txt', '\\t',
+               'salesid INTEGER NOT NULL PRIMARY KEY, listid INTEGER NOT NULL, sellerid INTEGER NOT NULL, buyerid INTEGER NOT NULL, eventid INTEGER NOT NULL, dateid SMALLINT NOT NULL, qtysold SMALLINT NOT NULL, pricepaid DECIMAL(8,2), commission DECIMAL(8,2), saletime TIMESTAMP',
+               None),
+          ]
+          def lambda_handler(event, context):
+              logger.info(f"Event: {event}")
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              if event['RequestType'] not in ['Create', 'Update']:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  props = event['ResourceProperties']
+                  secret = json.loads(boto3.client('secretsmanager').get_secret_value(SecretId=props['SecretArn'])['SecretString'])
+                  s3 = boto3.client('s3')
+                  os.makedirs('/tmp/data', exist_ok=True)
+                  for tname, fname, _, _, _ in TABLES:
+                      s3.download_file(props['S3Bucket'], fname, f'/tmp/data/{fname}')
+                      logger.info(f"Downloaded {fname}")
+                  conn = pymysql.connect(host=props['DBEndpoint'], user=secret['username'],
+                      password=secret['password'], database=props['DBName'],
+                      local_infile=True, connect_timeout=30, read_timeout=300, write_timeout=300)
+                  try:
+                      cur = conn.cursor()
+                      for tname, fname, delim, ddl, cols in TABLES:
+                          cur.execute(f"CREATE TABLE IF NOT EXISTS {tname} ({ddl})")
+                          conn.commit()
+                          fpath = f'/tmp/data/{fname}'
+                          if tname == 'sales':
+                              cur.execute(f"LOAD DATA LOCAL INFILE '{fpath}' INTO TABLE {tname} FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' (salesid, listid, sellerid, buyerid, eventid, dateid, qtysold, pricepaid, commission, @saletime) SET saletime = STR_TO_DATE(@saletime, '%c/%e/%Y %H:%i:%s')")
+                          else:
+                              cur.execute(f"LOAD DATA LOCAL INFILE '{fpath}' INTO TABLE {tname} FIELDS TERMINATED BY '{delim}' LINES TERMINATED BY '\\n' {cols}")
+                          conn.commit()
+                          cur.execute(f"SELECT COUNT(*) FROM {tname}")
+                          logger.info(f"{tname}: {cur.fetchone()[0]} records loaded")
+                  finally:
+                      conn.close()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'All tables loaded'})
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Custom Resource to trigger Aurora data loading via Lambda
+  AuroraDataLoad:
+    Type: Custom::AuroraDataLoad
+    DependsOn:
+      - AuroraDBInstance
+      - TickitDataDownload
+    Properties:
+      ServiceToken: !GetAtt AuroraDataLoaderLambda.Arn
+      DBEndpoint: !GetAtt AuroraDBCluster.Endpoint.Address
+      DBName: !Ref DatabaseName
+      SecretArn: !Ref AuroraAdminSecret
+      S3Bucket: !Ref TickitDataBucket
+      Version: '1.0'
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  AuroraClusterEndpoint:
+    Description: Aurora MySQL Cluster Endpoint
+    Value: !GetAtt AuroraDBCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-AuroraEndpoint'
+
+  AuroraClusterPort:
+    Description: Aurora MySQL Port
+    Value: !GetAtt AuroraDBCluster.Endpoint.Port
+
+  DatabaseName:
+    Description: Database Name
+    Value: !Ref DatabaseName
+
+  SecretArn:
+    Description: Secrets Manager ARN for Aurora credentials
+    Value: !Ref AuroraAdminSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretArn'
+
+  S3TableBucketArn:
+    Description: S3 Tables Bucket ARN (created by Lambda, retained on stack deletion)
+    Value: !Sub 'arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${S3TableBucketName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-S3TableBucketArn'
+
+  S3TableBucketName:
+    Description: S3 Tables Bucket Name (created by Lambda, retained on stack deletion)
+    Value: !Ref S3TableBucketName
+
+  S3TableNamespaceName:
+    Description: S3 Tables Namespace Name
+    Value: !Ref S3TableNamespace
+
+  GlueJobName:
+    Description: Glue Job Name (MySQL to S3 Tables Iceberg Migration)
+    Value: !Ref MySQLToIcebergGlueJob
+
+  AuroraDataLoaderLambdaArn:
+    Description: Lambda Function ARN for Aurora TICKIT Data Loader
+    Value: !GetAtt AuroraDataLoaderLambda.Arn
+
+  GlueConnectionName:
+    Description: Glue Connection Name
+    Value: !Ref GlueAuroraConnection
+
+  GlueAssetsBucket:
+    Description: S3 Bucket for Glue Scripts
+    Value: !Ref GlueAssetsBucket
+
+  TickitDataBucketName:
+    Description: S3 Bucket for TICKIT sample data (automatically populated during stack creation)
+    Value: !Ref TickitDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TickitDataBucket'
+
+  TickitDataLoaderLambdaArn:
+    Description: Lambda Function ARN for TICKIT data loader (S3 file downloader)
+    Value: !GetAtt TickitDataLoaderLambda.Arn
