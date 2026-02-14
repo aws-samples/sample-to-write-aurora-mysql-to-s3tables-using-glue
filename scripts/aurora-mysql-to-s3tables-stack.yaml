@@ -202,6 +202,10 @@ Resources:
           ToPort: 443
           CidrIp: !Ref VpcCidr
           Description: HTTPS access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-vpc-endpoint-sg'
@@ -228,6 +232,10 @@ Resources:
           ToPort: 3306
           CidrIp: !Ref VpcCidr
           Description: MySQL access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-aurora-sg'
@@ -237,6 +245,10 @@ Resources:
     Properties:
       GroupDescription: Security group for Glue connections
       VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-glue-sg'
@@ -798,6 +810,7 @@ Resources:
       ServerlessV2ScalingConfiguration:
         MinCapacity: 0.5
         MaxCapacity: 1
+      StorageEncrypted: true
       BackupRetentionPeriod: 7
       PreferredBackupWindow: '03:00-04:00'
       PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
@@ -934,25 +947,64 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
-        - arn:aws:iam::aws:policy/AmazonS3FullAccess
-        - arn:aws:iam::aws:policy/AmazonS3TablesFullAccess
-        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
       Policies:
-        - PolicyName: DirectS3TablesAccess
+        - PolicyName: S3Access
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: 's3tables:*'
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${GlueAssetsBucket}'
+                  - !Sub 'arn:aws:s3:::${GlueAssetsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::aws-glue-assets-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::aws-glue-assets-${AWS::AccountId}-${AWS::Region}/*'
+        - PolicyName: S3TablesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3tables:GetTableBucket
+                  - s3tables:ListTableBuckets
+                  - s3tables:GetTable
+                  - s3tables:ListTables
+                  - s3tables:CreateTable
+                  - s3tables:UpdateTableMetadataLocation
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:CreateNamespace
+                  - s3tables:ListNamespaces
+                  - s3tables:GetNamespace
+                  - s3tables:GetTableData
+                  - s3tables:PutTableData
                 Resource:
                   - !Sub 'arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${S3TableBucketName}'
                   - !Sub 'arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${S3TableBucketName}/*'
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AuroraAdminSecret
         - PolicyName: LakeFormationAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: 'lakeformation:GetDataAccess'
+                Action:
+                  - lakeformation:GetDataAccess
                 Resource: '*'
         - PolicyName: VPCNetworkAccess
           PolicyDocument:
