@@ -173,6 +173,11 @@ export PATH="$HOME/.local/bin:$PATH" && which uvx
 Create MCP configuration file. Locate and create the configuration directory using the following commands.
 
 ```bash
+touch ~/.kiro/settings/mcp.json
+ls -lrt ~/.kiro/settings/mcp.json
+```
+
+```bash
 cat > ~/.kiro/settings/mcp.json << EOF
 {
   "mcpServers": {
