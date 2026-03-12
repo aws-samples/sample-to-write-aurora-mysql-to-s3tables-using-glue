@@ -46,7 +46,7 @@ The following parameters may be configured before deploying the CloudFormation s
 
 ### Step 1: Deploy the CloudFormation Stack
 
-Deploy the CloudFormation template `scripts/aurora-mysql-to-s3tables-stack.yaml` using the AWS Console or the AWS CLI. If you are not using the AWS CLI then provide a name for the S3 Tables bucket, the stack will create it automatically (or use an existing one if it already exists):
+Deploy the CloudFormation template `scripts/aurora-mysql-to-s3tables-stack.yaml` using the AWS Console or the AWS CLI. If you are not using the AWS CLI then provide a name for the S3 Tables bucket, the stack will create it automatically (or use an existing one if it already exists).
 
 1. In order to deploy the CloudFormation template using AWS Console head to the [AWS CloudFormation Console](https://console.aws.amazon.com/cloudformation/) and follow as mentioned in the screenshots below.
 
@@ -58,7 +58,7 @@ Deploy the CloudFormation template `scripts/aurora-mysql-to-s3tables-stack.yaml`
 ![CF_Create_in_progress](images/CF_Create_in_progress.png)
 ![CF_Create_Complete](images/CF_Create_Complete.png)
 
-If you prefer using the AWS CLI, first upload the template to an S3 bucket (the template exceeds the 51,200 byte limit for inline `--template-body`), then create the stack:
+If you prefer using the AWS CLI, first upload the template to an S3 bucket (the template exceeds the 51,200 byte limit for inline `--template-body`), then create the stack.
 
 ```bash
 # Upload the template to S3
@@ -228,4 +228,4 @@ See [CODE_OF_CONDUCT](CODE_OF_CONDUCT.md) for more information.
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
 
 ## License
-This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file. 
+This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
