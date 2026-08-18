@@ -17,6 +17,18 @@ Parameters:
     Default: 10.1.0.0/16
     Description: CIDR block for VPC
 
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First Availability Zone for the private subnets
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second Availability Zone for the private subnets
+
+  AvailabilityZone3:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Third Availability Zone for the private subnets
+
   S3TableBucketName:
     Type: String
     Description: Name of the S3 Tables bucket to create (or use existing)
@@ -27,6 +39,28 @@ Parameters:
     Type: String
     Default: tickit
     Description: Namespace for S3 Tables
+
+Rules:
+  AvailabilityZonesMustBeDistinct:
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - !Ref AvailabilityZone1
+                - !Ref AvailabilityZone2
+        AssertDescription: AvailabilityZone1 and AvailabilityZone2 must be different
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - !Ref AvailabilityZone1
+                - !Ref AvailabilityZone3
+        AssertDescription: AvailabilityZone1 and AvailabilityZone3 must be different
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - !Ref AvailabilityZone2
+                - !Ref AvailabilityZone3
+        AssertDescription: AvailabilityZone2 and AvailabilityZone3 must be different
 
 Resources:
   # VPC and Networking
@@ -45,7 +79,7 @@ Resources:
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.1.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
+      AvailabilityZone: !Ref AvailabilityZone1
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-private-subnet-1'
@@ -55,7 +89,7 @@ Resources:
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.1.2.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
+      AvailabilityZone: !Ref AvailabilityZone2
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-private-subnet-2'
@@ -65,7 +99,7 @@ Resources:
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.1.3.0/24
-      AvailabilityZone: !Select [2, !GetAZs '']
+      AvailabilityZone: !Ref AvailabilityZone3
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-private-subnet-3'
@@ -327,7 +361,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub '${AWS::StackName}-tickit-data-loader'
-      Runtime: python3.11
+      Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt TickitDataLoaderLambdaRole.Arn
       Timeout: 300
@@ -442,7 +476,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub '${AWS::StackName}-glue-script-uploader'
-      Runtime: python3.11
+      Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt GlueScriptUploaderRole.Arn
       Timeout: 60
@@ -1020,10 +1054,249 @@ Resources:
                   - ec2:DescribeSecurityGroups
                 Resource: '*'
 
+  # Waits asynchronously for Glue to release its ENIs, then deletes them before
+  # CloudFormation deletes the connection subnet and security groups.
+  GlueEniCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-GlueEniCleanupRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueEniCleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-glue-eni-cleanup'
+
+  GlueEniCleanupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-glue-eni-cleanup'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt GlueEniCleanupRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import time
+
+          import boto3
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ec2 = boto3.client('ec2')
+          lambda_client = boto3.client('lambda')
+
+          def get_interfaces(security_group_id, subnet_id):
+              interfaces = []
+              paginator = ec2.get_paginator('describe_network_interfaces')
+              filters = [
+                  {'Name': 'group-id', 'Values': [security_group_id]},
+                  {'Name': 'subnet-id', 'Values': [subnet_id]}
+              ]
+              for page in paginator.paginate(Filters=filters):
+                  interfaces.extend(page.get('NetworkInterfaces', []))
+              return interfaces
+
+          def send_response(event, context, status, data, physical_id):
+              cfnresponse.send(
+                  event,
+                  context,
+                  status,
+                  data,
+                  physicalResourceId=physical_id
+              )
+
+          def continue_cleanup(event, context):
+              continuation = dict(event)
+              continuation['CleanupWorker'] = True
+              continuation['CleanupAttempt'] = (
+                  int(event.get('CleanupAttempt', 0)) + 1
+              )
+              continuation.setdefault(
+                  'CleanupDeadline',
+                  int(time.time()) + 3300
+              )
+              lambda_client.invoke(
+                  FunctionName=context.invoked_function_arn,
+                  InvocationType='Event',
+                  Payload=json.dumps(continuation).encode('utf-8')
+              )
+              logger.info(
+                  "Queued cleanup attempt %s",
+                  continuation['CleanupAttempt']
+              )
+
+          def lambda_handler(event, context):
+              logger.info("Event: %s", event)
+
+              properties = event.get('ResourceProperties', {})
+              security_group_id = properties.get('GlueSecurityGroupId', 'unknown')
+              subnet_id = properties.get('SubnetId', 'unknown')
+              physical_id = event.get(
+                  'PhysicalResourceId',
+                  f'glue-eni-cleanup-{security_group_id}'
+              )
+
+              if event.get('RequestType') != 'Delete':
+                  send_response(
+                      event, context, cfnresponse.SUCCESS, {}, physical_id
+                  )
+                  return
+
+              if not event.get('CleanupWorker'):
+                  try:
+                      continue_cleanup(event, context)
+                  except Exception as error:
+                      logger.exception("Unable to start Glue ENI cleanup")
+                      send_response(
+                          event,
+                          context,
+                          cfnresponse.FAILED,
+                          {'Error': str(error)},
+                          physical_id
+                      )
+                  return
+
+              try:
+                  invocation_deadline = time.time() + min(
+                      720,
+                      max(30, context.get_remaining_time_in_millis() / 1000 - 30)
+                  )
+                  cleanup_deadline = int(
+                      event.get('CleanupDeadline', int(time.time()) + 3300)
+                  )
+
+                  while True:
+                      interfaces = get_interfaces(security_group_id, subnet_id)
+                      if not interfaces:
+                          send_response(
+                              event,
+                              context,
+                              cfnresponse.SUCCESS,
+                              {'DeletedNetworkInterfaces': True},
+                              physical_id
+                          )
+                          return
+
+                      for interface in interfaces:
+                          interface_id = interface['NetworkInterfaceId']
+                          attachment = interface.get('Attachment')
+                          requester_managed = interface.get(
+                              'RequesterManaged',
+                              False
+                          )
+                          is_deletable = (
+                              interface.get('Status') == 'available'
+                              and not attachment
+                              and not requester_managed
+                          )
+                          if not is_deletable:
+                              logger.info(
+                                  "Waiting for ENI %s (status=%s, requesterManaged=%s)",
+                                  interface_id,
+                                  interface.get('Status'),
+                                  requester_managed
+                              )
+                              continue
+
+                          try:
+                              logger.info("Deleting unattached Glue ENI %s", interface_id)
+                              ec2.delete_network_interface(
+                                  NetworkInterfaceId=interface_id
+                              )
+                          except ClientError as error:
+                              error_code = error.response['Error']['Code']
+                              if error_code != 'InvalidNetworkInterfaceID.NotFound':
+                                  logger.warning(
+                                      "Delete attempt for ENI %s failed: %s",
+                                      interface_id,
+                                      error
+                                  )
+
+                      if time.time() >= invocation_deadline:
+                          remaining_interfaces = get_interfaces(
+                              security_group_id,
+                              subnet_id
+                          )
+                          if not remaining_interfaces:
+                              send_response(
+                                  event,
+                                  context,
+                                  cfnresponse.SUCCESS,
+                                  {'DeletedNetworkInterfaces': True},
+                                  physical_id
+                              )
+                              return
+
+                          remaining = [
+                              {
+                                  'id': interface['NetworkInterfaceId'],
+                                  'status': interface.get('Status'),
+                                  'requesterManaged': interface.get(
+                                      'RequesterManaged',
+                                      False
+                                  )
+                              }
+                              for interface in remaining_interfaces
+                          ]
+                          if time.time() < cleanup_deadline:
+                              logger.info(
+                                  "Glue ENIs still present; continuing asynchronously: %s",
+                                  remaining
+                              )
+                              continue_cleanup(event, context)
+                              return
+
+                          raise RuntimeError(
+                              f'Timed out waiting for Glue ENIs to be released: {remaining}'
+                          )
+
+                      time.sleep(10)
+              except Exception as error:
+                  logger.exception("Glue ENI cleanup failed")
+                  send_response(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {'Error': str(error)},
+                      physical_id
+                  )
+
+  GlueEniCleanup:
+    Type: Custom::GlueEniCleanup
+    Properties:
+      ServiceToken: !GetAtt GlueEniCleanupLambda.Arn
+      GlueSecurityGroupId: !Ref GlueSecurityGroup
+      AuroraSecurityGroupId: !Ref AuroraSecurityGroup
+      SubnetId: !Ref PrivateSubnet1
+      ServiceTimeout: 3600
+      Version: '2.0'
+
   # Glue Connection to Aurora MySQL (MYSQL type with schema v2 for Glue 5.0)
   GlueAuroraConnection:
     Type: AWS::Glue::Connection
-    DependsOn: GlueJobRole
+    DependsOn: GlueEniCleanup
     Properties:
       CatalogId: !Ref AWS::AccountId
       ConnectionInput:
@@ -1045,7 +1318,7 @@ Resources:
           SecurityGroupIdList:
             - !Ref GlueSecurityGroup
             - !Ref AuroraSecurityGroup
-          AvailabilityZone: !Select [0, !GetAZs '']
+          AvailabilityZone: !Ref AvailabilityZone1
 
   # Glue Job
   MySQLToIcebergGlueJob:
@@ -1229,10 +1502,10 @@ Resources:
                 Resource: !Ref AuroraAdminSecret
 
   # Lambda Function to load TICKIT data into Aurora MySQL using PyMySQL
-  AuroraDataLoaderLambda:
+  AuroraDataLoaderWorkerLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${AWS::StackName}-aurora-data-loader'
+      FunctionName: !Sub '${AWS::StackName}-aurora-data-loader-worker'
       Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt AuroraDataLoaderRole.Arn
@@ -1248,7 +1521,6 @@ Resources:
       Code:
         ZipFile: |
           import json, os, boto3, pymysql, logging
-          import cfnresponse
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
           # Table definitions: (name, file, delimiter, DDL columns, LOAD columns)
@@ -1277,12 +1549,6 @@ Resources:
           ]
           def lambda_handler(event, context):
               logger.info(f"Event: {event}")
-              if event['RequestType'] == 'Delete':
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                  return
-              if event['RequestType'] not in ['Create', 'Update']:
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                  return
               try:
                   props = event['ResourceProperties']
                   secret = json.loads(boto3.client('secretsmanager').get_secret_value(SecretId=props['SecretArn'])['SecretString'])
@@ -1309,10 +1575,141 @@ Resources:
                           logger.info(f"{tname}: {cur.fetchone()[0]} records loaded")
                   finally:
                       conn.close()
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'All tables loaded'})
+                  return {
+                      'Status': 'SUCCESS',
+                      'Data': {'Status': 'All tables loaded'}
+                  }
               except Exception as e:
-                  logger.error(f"Error: {str(e)}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                  logger.exception(f"Error loading Aurora data: {str(e)}")
+                  raise
+
+  # Non-VPC custom resource coordinator keeps CloudFormation response delivery
+  # independent of the private VPC while invoking the VPC worker for data loads.
+  AuroraDataLoadHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-AuroraDataLoadHandlerRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeAuroraDataLoader
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt AuroraDataLoaderWorkerLambda.Arn
+
+  AuroraDataLoaderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-aurora-data-loader'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AuroraDataLoadHandlerRole.Arn
+      Timeout: 900
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref AuroraDataLoaderWorkerLambda
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          lambda_client = boto3.client('lambda')
+          LOAD_PROPERTIES = (
+              'DBEndpoint',
+              'DBName',
+              'SecretArn',
+              'S3Bucket',
+              'Version'
+          )
+
+          def should_load(event):
+              if event['RequestType'] == 'Create':
+                  return True
+              if event['RequestType'] != 'Update':
+                  return False
+
+              properties = event.get('ResourceProperties', {})
+              old_properties = event.get('OldResourceProperties', {})
+              return any(
+                  properties.get(name) != old_properties.get(name)
+                  for name in LOAD_PROPERTIES
+              )
+
+          def lambda_handler(event, context):
+              logger.info("Event: %s", event)
+              physical_id = event.get(
+                  'PhysicalResourceId',
+                  f"aurora-data-load-{event['RequestId']}"
+              )
+
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {},
+                      physicalResourceId=physical_id
+                  )
+                  return
+
+              if not should_load(event):
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {'Status': 'No data reload required'},
+                      physicalResourceId=physical_id
+                  )
+                  return
+
+              try:
+                  response = lambda_client.invoke(
+                      FunctionName=os.environ['WORKER_FUNCTION_NAME'],
+                      InvocationType='RequestResponse',
+                      Payload=json.dumps({
+                          'ResourceProperties': event['ResourceProperties']
+                      }).encode('utf-8')
+                  )
+                  payload = json.loads(response['Payload'].read())
+                  if response.get('FunctionError'):
+                      raise RuntimeError(
+                          payload.get('errorMessage', json.dumps(payload))
+                      )
+
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      payload.get('Data', {}),
+                      physicalResourceId=physical_id
+                  )
+              except Exception as error:
+                  logger.exception("Aurora data load failed")
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {'Error': str(error)},
+                      physicalResourceId=physical_id
+                  )
 
   # Custom Resource to trigger Aurora data loading via Lambda
   AuroraDataLoad:
@@ -1320,6 +1717,7 @@ Resources:
     DependsOn:
       - AuroraDBInstance
       - TickitDataDownload
+      - S3VPCEndpoint
     Properties:
       ServiceToken: !GetAtt AuroraDataLoaderLambda.Arn
       DBEndpoint: !GetAtt AuroraDBCluster.Endpoint.Address
@@ -1375,7 +1773,7 @@ Outputs:
 
   AuroraDataLoaderLambdaArn:
     Description: Lambda Function ARN for Aurora TICKIT Data Loader
-    Value: !GetAtt AuroraDataLoaderLambda.Arn
+    Value: !GetAtt AuroraDataLoaderWorkerLambda.Arn
 
   GlueConnectionName:
     Description: Glue Connection Name

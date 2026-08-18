@@ -18,16 +18,16 @@ The architecture consists of the following components:
 1. **Amazon Aurora MySQL Serverless v2** - Source relational database containing the TICKIT sample dataset (users, venue, category, date, event, listing, and sales tables).
 2. **AWS Secrets Manager** - Stores the Aurora MySQL database credentials securely.
 3. **Amazon S3 (Staging Bucket)** - Stages the TICKIT sample data files downloaded from the public `redshift-downloads` S3 bucket.
-4. **AWS Lambda (PyMySQL)** - Loads the staged TICKIT data files into the Aurora MySQL database using PyMySQL with `LOAD DATA LOCAL INFILE`.
+4. **AWS Lambda (PyMySQL)** - A non-VPC custom-resource coordinator invokes a VPC-attached worker that loads the staged TICKIT data files into Aurora MySQL using PyMySQL with `LOAD DATA LOCAL INFILE`. The coordinator reports CloudFormation responses without relying on private VPC egress.
 5. **AWS Glue Job (Glue 5.0)** - Reads tables from Aurora MySQL via a native MYSQL connection and writes them to S3 Tables in Apache Iceberg format using the S3 Tables REST catalog endpoint.
 6. **Amazon S3 Tables** - Target storage that stores the migrated tables in Apache Iceberg format.
-7. **VPC with Private Subnets** - All resources run within private subnets with VPC endpoints for S3, S3 Tables, Glue, Secrets Manager, STS, CloudWatch Logs, and CloudFormation.
+7. **VPC with Private Subnets** - All resources run within private subnets across three user-selected Availability Zones, with VPC endpoints for S3, S3 Tables, Glue, Secrets Manager, STS, CloudWatch Logs, and CloudFormation.
 
 ## Sample Data
 We will be using the [TICKIT, a sample database that Amazon Redshift documentation examples use](https://docs.aws.amazon.com/redshift/latest/dg/c_sampledb.html). The data is available in public S3 bucket `s3://redshift-downloads/tickit/` as mentioned [here](https://docs.aws.amazon.com/redshift/latest/gsg/new-user-serverless.html).
 
 ## Prerequisites
-This solution requires an AWS account. Follow this [link](https://aws.amazon.com/resources/create-account/) to create an AWS account if you do not have one. Specific permissions required for both account which will be set up in subsequent steps.
+This solution requires an AWS account. Follow this [link](https://aws.amazon.com/resources/create-account/) to create an AWS account if you do not have one. The selected Region must provide at least three Availability Zones and support Amazon S3 Tables, AWS Glue 5.0, and Amazon Aurora MySQL Serverless v2.
 
 ## Implementation walkthrough
 Following are the step by step implementation guide.
@@ -42,11 +42,14 @@ The following parameters may be configured before deploying the CloudFormation s
 | `DatabaseName` | Name of the initial Aurora MySQL database | `tickit` | No |
 | `MasterUsername` | Master username for Aurora MySQL | `admin` | No |
 | `VpcCidr` | CIDR block for the VPC | `10.1.0.0/16` | No |
+| `AvailabilityZone1` | First Availability Zone for the private subnets | — | Yes |
+| `AvailabilityZone2` | Second Availability Zone for the private subnets | — | Yes |
+| `AvailabilityZone3` | Third Availability Zone for the private subnets | — | Yes |
 | `S3TableNamespace` | Namespace for S3 Tables | `tickit` | No |
 
 ### Step 1: Deploy the CloudFormation Stack
 
-Deploy the CloudFormation template `scripts/aurora-mysql-to-s3tables-stack.yaml` using the AWS Console or the AWS CLI. If you are not using the AWS CLI then provide a name for the S3 Tables bucket, the stack will create it automatically (or use an existing one if it already exists).
+Deploy the CloudFormation template `scripts/aurora-mysql-to-s3tables-stack.yaml` using the AWS Console or the AWS CLI. Provide a name for the S3 Tables bucket and select three distinct Availability Zones in the deployment Region. The stack creates the S3 Tables bucket automatically, or uses it if it already exists.
 
 1. In order to deploy the CloudFormation template using AWS Console head to the [AWS CloudFormation Console](https://console.aws.amazon.com/cloudformation/) and follow as mentioned in the screenshots below.
 
@@ -58,7 +61,17 @@ Deploy the CloudFormation template `scripts/aurora-mysql-to-s3tables-stack.yaml`
 ![CF_Create_in_progress](images/CF_Create_in_progress.png)
 ![CF_Create_Complete](images/CF_Create_Complete.png)
 
-If you prefer using the AWS CLI, first upload the template to an S3 bucket (the template exceeds the 51,200 byte limit for inline `--template-body`), then create the stack.
+If you prefer using the AWS CLI, first list the available Availability Zones in the target Region:
+
+```bash
+aws ec2 describe-availability-zones \
+  --filters Name=zone-type,Values=availability-zone Name=state,Values=available \
+  --query 'AvailabilityZones[].ZoneName' \
+  --output text \
+  --region <your-region>
+```
+
+Choose three distinct values from the result. Then upload the template to an S3 bucket (the template exceeds the 51,200 byte limit for inline `--template-body`) and create the stack:
 
 ```bash
 # Upload the template to S3
@@ -72,13 +85,16 @@ aws cloudformation create-stack \
   --template-url https://<your-s3-bucket>.s3.<your-region>.amazonaws.com/aurora-mysql-to-s3tables-stack.yaml \
   --parameters \
     ParameterKey=S3TableBucketName,ParameterValue=<your-s3-table-bucket-name> \
+    ParameterKey=AvailabilityZone1,ParameterValue=<first-availability-zone> \
+    ParameterKey=AvailabilityZone2,ParameterValue=<second-availability-zone> \
+    ParameterKey=AvailabilityZone3,ParameterValue=<third-availability-zone> \
   --capabilities CAPABILITY_NAMED_IAM \
   --region <your-region>
 ```
 
 The stack will automatically:
 - Create the S3 Tables bucket (or use existing if it already exists)
-- Create a VPC with private subnets and VPC endpoints
+- Create a VPC with private subnets across the three selected Availability Zones and VPC endpoints
 - Provision an Aurora MySQL Serverless v2 cluster
 - Download TICKIT sample data from the public AWS S3 bucket
 - Load the sample data into Aurora MySQL via a Lambda function using PyMySQL
@@ -144,6 +160,8 @@ You can also query the migrated tables using Amazon Athena to validate the data.
 
 ### Step 5: Verify the Results using kiro-cli
 
+> **Prerequisite:** This walkthrough uses an [AWS Builder ID](https://docs.aws.amazon.com/signin/latest/userguide/create-builder-id.html) to authenticate with Kiro CLI. Create one before continuing if needed.
+
 1. Open an [AWS CloudShell](https://aws.amazon.com/cloudshell/), enter `kiro-cli` in the CloudShell.
 
 ![kiro-cli1](images/kiro-cli1.png)
@@ -207,6 +225,22 @@ Run the following prompt. Change to appropriate s3 table bucket name
 The records counts should match the ones from Aurora Query Editor.
 
 ![kiro-cli-mcp6](images/kiro-cli-mcp6.png)
+
+### Step 6: Clean Up
+
+When you have finished testing, delete the CloudFormation stack and wait for deletion to complete:
+
+```bash
+aws cloudformation delete-stack \
+  --stack-name aurora-mysql-tickit-stack \
+  --region <your-region>
+
+aws cloudformation wait stack-delete-complete \
+  --stack-name aurora-mysql-tickit-stack \
+  --region <your-region>
+```
+
+The stack releases and removes network interfaces created for the Glue VPC connection before deleting its subnet and security groups. It keeps the S3 Tables bucket, the Glue assets S3 bucket, and the TICKIT staging S3 bucket so that migrated data and deployment artifacts are not deleted accidentally. Delete these retained resources separately when they are no longer required.
 
 
 ## Summary
